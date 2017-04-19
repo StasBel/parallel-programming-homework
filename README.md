@@ -1,3 +1,3 @@
 # parallel-programming-homework
 
-## opencl
+## pthreads
