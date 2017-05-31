@@ -1,47 +1,78 @@
 #define __CL_ENABLE_EXCEPTIONS
+#define SIZE(sz) BLOCK_SIZE * ((sz + BLOCK_SIZE - 1) / BLOCK_SIZE)
 
 #include "cl.hpp"
 
 #include <iostream>
-#include <vector>
 #include <fstream>
+#include <sstream>
 
 using namespace std;
 
-void read_input(int &n, int &m, float *&a, float *&b) {
-    FILE *const input_file = fopen("input.txt", "r");
+const size_t BLOCK_SIZE = 512;
 
-    fscanf(input_file, "%d %d\n", &n, &m);
+void read_input(size_t &n, vector<float> &vec) {
+    FILE *file = fopen("input.txt", "r");
 
-    a = new float[n * n];
+    int d;
+    fscanf(file, "%d\n", &d);
+    n = (size_t) d;
+
+    vec.resize(n);
     for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            fscanf(input_file, "%f", &a[i * n + j]);
-        }
+        fscanf(file, "%f", &vec[i]);
     }
 
-    b = new float[m * m];
-    for (int i = 0; i < m; ++i) {
-        for (int j = 0; j < m; ++j) {
-            fscanf(input_file, "%f", &b[i * m + j]);
-        }
-    }
-
-    fclose(input_file);
+    fclose(file);
 }
 
-void write_output(const float *const c, const int n) {
-    FILE *const output_file = fopen("output.txt", "w");
+void write_output(const vector<float> &vec, const size_t n) {
+    FILE *file = fopen("output.txt", "w");
 
     for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            fprintf(output_file, "%0.3f ", c[i * n + j]);
-        }
-        fprintf(output_file, "\n");
+        fprintf(file, "%0.3f ", vec[i]);
     }
 
-    fflush(output_file);
-    fclose(output_file);
+    fflush(file);
+    fclose(file);
+}
+
+vector<float> prefix_sum(cl::Context &context, cl::CommandQueue &queue,
+                         cl::Program &program, vector<float> &input) {
+    cl::Buffer input_buf(context, CL_MEM_READ_ONLY, sizeof(float) * input.size());
+    queue.enqueueWriteBuffer(input_buf, CL_TRUE, 0, sizeof(float) * input.size(), &input[0]);
+
+    cl::Kernel kernel(program, "scan");
+    cl::KernelFunctor scan(kernel, queue, cl::NullRange, cl::NDRange(input.size()), cl::NDRange(BLOCK_SIZE));
+    cl::Buffer output_buf(context, CL_MEM_WRITE_ONLY, sizeof(float) * input.size());
+    cl::Event event = scan(input_buf, output_buf,
+                           cl::__local(sizeof(float) * BLOCK_SIZE), cl::__local(sizeof(float) * BLOCK_SIZE));
+    event.wait();
+
+    vector<float> output(input.size(), 0);
+    queue.enqueueReadBuffer(output_buf, CL_TRUE, 0, sizeof(float) * output.size(), &output[0]);
+
+    if (output.size() == BLOCK_SIZE) {
+        return output;
+    } else {
+        vector<float> tails(SIZE(output.size() / BLOCK_SIZE), 0);
+        for (int i = 1; i * BLOCK_SIZE - 1 < output.size() && i < tails.size(); ++i) {
+            tails[i] = output[i * BLOCK_SIZE - 1];
+        }
+        vector<float> tails_prefix = prefix_sum(context, queue, program, tails);
+        cl::Buffer inc_input_buf(context, CL_MEM_READ_ONLY, sizeof(float) * tails_prefix.size());
+        queue.enqueueWriteBuffer(input_buf, CL_TRUE, 0, sizeof(float) * output.size(), &output[0]);
+        queue.enqueueWriteBuffer(inc_input_buf, CL_TRUE, 0, sizeof(float) * tails_prefix.size(), &tails_prefix[0]);
+        cl::Kernel kernel_inc(program, "inc");
+        cl::KernelFunctor inc(kernel_inc, queue, cl::NullRange, cl::NDRange(input.size()), cl::NDRange(BLOCK_SIZE));
+        cl::Event inc_event = inc(input_buf, inc_input_buf, output_buf);
+        inc_event.wait();
+
+        vector<float> result(input.size(), 0);
+        queue.enqueueReadBuffer(output_buf, CL_TRUE, 0, sizeof(float) * result.size(), &result[0]);
+
+        return result;
+    }
 }
 
 int main() {
@@ -57,54 +88,32 @@ int main() {
 
         cl::CommandQueue queue(context, devices.front(), CL_QUEUE_PROFILING_ENABLE);
 
-        ifstream cl_file("matrix_conv.cl");
+        ifstream cl_file("matrix_scan.cl");
         string cl_string(istreambuf_iterator<char>(cl_file), (istreambuf_iterator<char>()));
         cl::Program::Sources source(1, make_pair(cl_string.c_str(), cl_string.length() + 1));
-
         cl::Program program(context, source);
 
         try {
-            program.build(devices, "-D BLOCK_SIZE=16");
-        } catch (cl::Error const &e) {
+            ostringstream ost;
+            ost << "-D BLOCK_SIZE=" << BLOCK_SIZE;
+            program.build(devices, ost.str().c_str());
+        } catch (const cl::Error &e) {
             std::string log_str = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(devices[0]);
             std::cout << std::endl << e.what() << " : " << e.err() << std::endl;
             std::cout << log_str;
             return 1;
         }
 
-        int n, m;
-        float *a, *b;
-        read_input(n, m, a, b);
-        float c[n * n];
+        size_t n;
+        std::vector<float> input_vec;
+        read_input(n, input_vec);
 
-        const int block_size = 16;
-        const int matrix_size_a = n * n;
-        const int matrix_size_b = m * m;
-        const int matrix_size_c = n * n;
+        input_vec.resize(SIZE(n));
+        vector<float> output_vec = prefix_sum(context, queue, program, input_vec);
 
-        cl::Buffer dev_a(context, CL_MEM_READ_ONLY, sizeof(float) * matrix_size_a);
-        cl::Buffer dev_b(context, CL_MEM_READ_ONLY, sizeof(float) * matrix_size_b);
-        cl::Buffer dev_c(context, CL_MEM_WRITE_ONLY, sizeof(float) * matrix_size_c);
-
-        queue.enqueueWriteBuffer(dev_a, CL_TRUE, 0, sizeof(float) * matrix_size_a, a);
-        queue.enqueueWriteBuffer(dev_b, CL_TRUE, 0, sizeof(float) * matrix_size_b, b);
-
-        cl::Kernel kernel(program, "matrix_conv");
-        kernel.setArg(0, dev_a);
-        kernel.setArg(1, dev_b);
-        kernel.setArg(2, dev_c);
-        kernel.setArg(3, n);
-        kernel.setArg(4, m);
-        const int N = block_size * ((n + block_size - 1) / block_size);
-        queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange((size_t) N, (size_t) N),
-                                   cl::NDRange(block_size, block_size));
-
-        queue.enqueueReadBuffer(dev_c, CL_TRUE, 0, sizeof(float) * matrix_size_c, c);
-
-        write_output(c, n);
+        write_output(output_vec, n);
     } catch (cl::Error const &e) {
         std::cout << std::endl << e.what() << " : " << e.err() << std::endl;
     }
-
-    return 0;
 }
+
